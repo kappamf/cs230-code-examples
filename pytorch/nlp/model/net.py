@@ -11,17 +11,17 @@ class Net(nn.Module):
     This is the standard way to define your own network in PyTorch. You typically choose the components
     (e.g. LSTMs, linear layers etc.) of your network in the __init__ function. You then apply these layers
     on the input step-by-step in the forward function. You can use torch.nn.functional to apply functions
-    such as F.relu, F.sigmoid, F.softmax. Be careful to ensure your dimensions are correct after each step.
 
-    You are encouraged to have a look at the network in pytorch/vision/model/net.py to get a better sense of how
+    such as F.relu, F.sigmoid, F.softmax, F.max_pool2d. Be careful to ensure your dimensions are correct after each
+    step. You are encouraged to have a look at the network in pytorch/nlp/model/net.py to get a better sense of how
     you can go about defining your own network.
 
-    The documentation for all the various components available to you is here: http://pytorch.org/docs/master/nn.html
+    The documentation for all the various components available o you is here: http://pytorch.org/docs/master/nn.html
     """
 
     def __init__(self, params):
         """
-        We define an recurrent network that predicts the NER tags for each token in the sentence. The components
+        We define an convolutional network that predicts the sign from an image. The components
         required are:
 
         - an embedding layer: this layer maps each index in range(params.vocab_size) to a params.embedding_dim vector
@@ -29,113 +29,91 @@ class Net(nn.Module):
         - fc: a fully connected layer that converts the LSTM output for each token to a distribution over NER tags
 
         Args:
-            params: (Params) contains vocab_size, embedding_dim, lstm_hidden_dim
+            params: (Params) contains num_channels
         """
         super(Net, self).__init__()
-
-        # the embedding takes as input the vocab_size and the embedding_dim
-        self.embedding = nn.Embedding(params.vocab_size, params.embedding_dim)
-
-        # the LSTM takes as input the size of its input (embedding_dim), its hidden size
-        # for more details on how to use it, check out the documentation
-        self.lstm = nn.LSTM(params.embedding_dim, params.lstm_hidden_dim, batch_first=True)
-
-        # the fully connected layer transforms the output to give the final output layer
-        self.fc = nn.Linear(params.lstm_hidden_dim, params.number_of_tags)
+        self.num_channels = params.num_channels
         
+        # each of the convolution layers below have the arguments (input_channels, output_channels, filter_size,
+        # stride, padding). We also include batch normalisation layers that help stabilise training.
+        # For more details on how to use these layers, check out the documentation.
+        self.conv1 = nn.Conv2d(3, self.num_channels, 3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(self.num_channels)
+        self.conv2 = nn.Conv2d(self.num_channels, self.num_channels*2, 3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(self.num_channels*2)
+        self.conv3 = nn.Conv2d(self.num_channels*2, self.num_channels*4, 3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(self.num_channels*4)
+
+        # 2 fully connected layers to transform the output of the convolution layers to the final output
+        self.fc1 = nn.Linear(8*8*self.num_channels*4, self.num_channels*4)
+        self.fcbn1 = nn.BatchNorm1d(self.num_channels*4)
+        self.fc2 = nn.Linear(self.num_channels*4, 6)       
+        self.dropout_rate = params.dropout_rate
+
     def forward(self, s):
         """
         This function defines how we use the components of our network to operate on an input batch.
 
         Args:
-            s: (Variable) contains a batch of sentences, of dimension batch_size x seq_len, where seq_len is
-               the length of the longest sentence in the batch. For sentences shorter than seq_len, the remaining
-               tokens are PADding tokens. Each row is a sentence with each element corresponding to the index of
-               the token in the vocab.
+            s: (Variable) contains a batch of images, of dimension batch_size x 3 x 64 x 64 .
 
         Returns:
-            out: (Variable) dimension batch_size*seq_len x num_tags with the log probabilities of tokens for each token
-                 of each sentence.
+            out: (Variable) dimension batch_size x 6 with the log probabilities for the labels of each image.
 
         Note: the dimensions after each step are provided
         """
-        #                                -> batch_size x seq_len
-        # apply the embedding layer that maps each token to its embedding
-        s = self.embedding(s)            # dim: batch_size x seq_len x embedding_dim
+        #                                                  -> batch_size x 3 x 64 x 64
+        # we apply the convolution layers, followed by batch normalisation, maxpool and relu x 3
+        s = self.bn1(self.conv1(s))                         # batch_size x num_channels x 64 x 64
+        s = F.relu(F.max_pool2d(s, 2))                      # batch_size x num_channels x 32 x 32
+        s = self.bn2(self.conv2(s))                         # batch_size x num_channels*2 x 32 x 32
+        s = F.relu(F.max_pool2d(s, 2))                      # batch_size x num_channels*2 x 16 x 16
+        s = self.bn3(self.conv3(s))                         # batch_size x num_channels*4 x 16 x 16
+        s = F.relu(F.max_pool2d(s, 2))                      # batch_size x num_channels*4 x 8 x 8
 
-        # run the LSTM along the sentences of length seq_len
-        s, _ = self.lstm(s)              # dim: batch_size x seq_len x lstm_hidden_dim
+        # flatten the output for each image
+        s = s.view(-1, 8*8*self.num_channels*4)             # batch_size x 8*8*num_channels*4
 
-        # make the Variable contiguous in memory (a PyTorch artefact)
-        s = s.contiguous()
+        # apply 2 fully connected layers with dropout
+        s = F.dropout(F.relu(self.fcbn1(self.fc1(s))), 
+            p=self.dropout_rate, training=self.training)    # batch_size x self.num_channels*4
+        s = self.fc2(s)                                     # batch_size x 6
 
-        # reshape the Variable so that each row contains one token
-        s = s.view(-1, s.shape[2])       # dim: batch_size*seq_len x lstm_hidden_dim
-
-        # apply the fully connected layer and obtain the output (before softmax) for each token
-        s = self.fc(s)                   # dim: batch_size*seq_len x num_tags
-
-        # apply log softmax on each token's output (this is recommended over applying softmax
+        # apply log softmax on each image's output (this is recommended over applying softmax
         # since it is numerically more stable)
-        return F.log_softmax(s, dim=1)   # dim: batch_size*seq_len x num_tags
+        return F.log_softmax(s, dim=1)
 
 
 def loss_fn(outputs, labels):
     """
-    Compute the cross entropy loss given outputs from the model and labels for all tokens. Exclude loss terms
-    for PADding tokens.
+    Compute the cross entropy loss given outputs and labels.
 
     Args:
-        outputs: (Variable) dimension batch_size*seq_len x num_tags - log softmax output of the model
-        labels: (Variable) dimension batch_size x seq_len where each element is either a label in [0, 1, ... num_tag-1],
-                or -1 in case it is a PADding token.
+        outputs: (Variable) dimension batch_size x 6 - output of the model
+        labels: (Variable) dimension batch_size, where each element is a value in [0, 1, 2, 3, 4, 5]
 
     Returns:
-        loss: (Variable) cross entropy loss for all tokens in the batch
+        loss (Variable): cross entropy loss for all images in the batch
 
     Note: you may use a standard loss function from http://pytorch.org/docs/master/nn.html#loss-functions. This example
           demonstrates how you can easily define a custom loss function.
     """
+    num_examples = outputs.size()[0]
+    return -torch.sum(outputs[range(num_examples), labels])/num_examples
 
-    # reshape labels to give a flat vector of length batch_size*seq_len
-    labels = labels.view(-1)
 
-    # since PADding tokens have label -1, we can generate a mask to exclude the loss from those terms
-    mask = (labels >= 0).float()
-
-    # indexing with negative values is not supported. Since PADded tokens have label -1, we convert them to a positive
-    # number. This does not affect training, since we ignore the PADded tokens with the mask.
-    labels = labels % outputs.shape[1]
-
-    num_tokens = int(torch.sum(mask).data[0])
-
-    # compute cross entropy loss for all tokens (except PADding tokens), by multiplying with mask.
-    return -torch.sum(outputs[range(outputs.shape[0]), labels]*mask)/num_tokens
-    
-    
 def accuracy(outputs, labels):
     """
-    Compute the accuracy, given the outputs and labels for all tokens. Exclude PADding terms.
+    Compute the accuracy, given the outputs and labels for all images.
 
     Args:
-        outputs: (np.ndarray) dimension batch_size*seq_len x num_tags - log softmax output of the model
-        labels: (np.ndarray) dimension batch_size x seq_len where each element is either a label in
-                [0, 1, ... num_tag-1], or -1 in case it is a PADding token.
+        outputs: (np.ndarray) dimension batch_size x 6 - log softmax output of the model
+        labels: (np.ndarray) dimension batch_size, where each element is a value in [0, 1, 2, 3, 4, 5]
 
     Returns: (float) accuracy in [0,1]
     """
-
-    # reshape labels to give a flat vector of length batch_size*seq_len
-    labels = labels.ravel()
-
-    # since PADding tokens have label -1, we can generate a mask to exclude the loss from those terms
-    mask = (labels >= 0)
-
-    # np.argmax gives us the class predicted for each token by the model
     outputs = np.argmax(outputs, axis=1)
-
-    # compare outputs with labels and divide by number of tokens (excluding PADding tokens)
-    return np.sum(outputs==labels)/float(np.sum(mask))
+    return np.sum(outputs==labels)/float(labels.size)
 
 
 # maintain all metrics required in this dictionary- these are used in the training and evaluation loops
